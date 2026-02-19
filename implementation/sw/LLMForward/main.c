@@ -90,6 +90,13 @@ static inline uint16_t fp16_norm_lut(uint32_t k)
     return lut[k & 3];
 }
 
+// How many token-rows to move per chunk.
+// 256 rows * 128B/row = 32KB L1 scratch, usually safe.
+// Can tune later.
+#ifndef LLM_PACK_CHUNK_ROWS
+#define LLM_PACK_CHUNK_ROWS 256
+#endif
+
 // =======================================================
 // Helper: initialize hidden state H
 // =======================================================
@@ -236,54 +243,62 @@ static void llm_init_dummy_weights(uint32_t layer_id)
 static const uint32_t SPATZ_CHECK_LIST[ARCH_NUM_CORE_PER_CLUSTER] = ARCH_SPATZ_ATTACED_CHECK_LIST;
 static const uint32_t SPATZ_SID_LIST[ARCH_NUM_CORE_PER_CLUSTER] = ARCH_SPATZ_ATTACED_SID_LIST;
 
-static void llm_residual_add_spatz(uint64_t H_addr, uint64_t ADD_addr)
+static void llm_residual_add_spatz(uint64_t H_addr, uint64_t ADD_addr,
+                                   uint32_t num_tokens_arg, uint32_t hidden_arg)
 {
-    const uint32_t num_tokens = (uint32_t)NORM_M_SIZE;   // 128
-    const uint32_t hidden = (uint32_t)NORM_N_SIZE;       // 1024
+    const uint32_t num_tokens = num_tokens_arg;
+    const uint32_t hidden     = hidden_arg;
     const uint32_t elem_bytes = (uint32_t)LLM_ELEM_SIZE; // 2 for fp16
     const uint32_t token_bytes = hidden * elem_bytes;
 
     // ---- scratch allocation in L1/TCDM ----
-    // Leave some space at the bottom to avoid clobbering runtime/barrier metadata.
-    // Also align to 64 bytes.
+    // Align base to 64B; keep both buffers aligned.
     uint32_t base = local(0);
     base = (base + 63) & ~((uint32_t)63);
 
-    uint32_t L1_H = base;
-    uint32_t L1_ADD = base + token_bytes;
+    uint32_t L1_H   = base;
+    uint32_t L1_ADD = (L1_H + token_bytes + 63) & ~((uint32_t)63); // align second buffer too
 
     // ---- spatz/core info ----
-    const uint32_t core_id = flex_get_core_id();
+    const uint32_t core_id        = flex_get_core_id();
     const uint32_t spatz_attached = SPATZ_CHECK_LIST[core_id];
-    const uint32_t spatz_sid = SPATZ_SID_LIST[core_id];
-    const uint32_t spatz_num = ARCH_SPATZ_ATTACED_CORES; // 4 in your arch
+    const uint32_t spatz_sid      = SPATZ_SID_LIST[core_id];
+    const uint32_t spatz_num      = ARCH_SPATZ_ATTACED_CORES; // e.g., 4
 
     // ---- token distribution across clusters ----
-    // Simple striping: cluster k handles tokens k, k+16, k+32...
     uint32_t t = flex_get_cluster_id();
     while (t < num_tokens)
     {
-        // DMA in (DM core only)
+        // DMA in (DM core only): HBM -> L1
         if (flex_is_dm_core())
         {
-            flex_dma_async_1d(L1_H, H_addr + (uint64_t)t * token_bytes, token_bytes);
+            flex_dma_async_1d(L1_H,   H_addr   + (uint64_t)t * token_bytes, token_bytes);
             flex_dma_async_1d(L1_ADD, ADD_addr + (uint64_t)t * token_bytes, token_bytes);
             flex_dma_async_wait_all();
         }
         flex_intra_cluster_sync();
 
-        // Vector add on Spatz cores: L1_H[slice] += L1_ADD[slice]
+        // Vector add on Spatz cores: L1_H += L1_ADD (slice per spatz core)
         if (spatz_attached)
         {
-            const uint32_t slice_elems = hidden / spatz_num; // 1024/4 = 256
-            const uint32_t off_bytes = spatz_sid * slice_elems * elem_bytes;
+            // Ceil-div slice so we handle non-multiple hidden sizes safely.
+            const uint32_t slice_elems = (hidden + spatz_num - 1) / spatz_num;
+            const uint32_t start = spatz_sid * slice_elems;
+            uint32_t end = start + slice_elems;
+            if (end > hidden) end = hidden;
 
-            // vector_lib_bias(i_addr, o_addr, vlen) does: o += i
-            vector_lib_bias(L1_ADD + off_bytes, L1_H + off_bytes, slice_elems);
+            if (end > start)
+            {
+                const uint32_t off_bytes = start * elem_bytes;
+                const uint32_t vlen = end - start;
+
+                // vector_lib_bias(i_addr, o_addr, vlen) does: o += i
+                vector_lib_bias(L1_ADD + off_bytes, L1_H + off_bytes, vlen);
+            }
         }
         flex_intra_cluster_sync();
 
-        // DMA out (DM core only)
+        // DMA out (DM core only): L1 -> HBM
         if (flex_is_dm_core())
         {
             flex_dma_async_1d(H_addr + (uint64_t)t * token_bytes, L1_H, token_bytes);
@@ -295,83 +310,117 @@ static void llm_residual_add_spatz(uint64_t H_addr, uint64_t ADD_addr)
     }
 }
 
+
 // =======================================================
 // Transform tm (token-major) to hm (head-major)
 // =======================================================
 
-static void llm_pack_tm_to_hm(uint64_t src_tm, uint64_t dst_hm_all)
+static void llm_pack_tm_to_hm(uint64_t src_tm, uint64_t dst_hm, uint32_t seq_len)
 {
     const uint32_t head = flex_get_cluster_id();
-    if (head >= (uint32_t)LLM_N_HEAD)
-        return;
+    if (head >= (uint32_t)LLM_N_HEAD || seq_len == 0) return;
 
-    const uint32_t row_bytes = (uint32_t)(LLM_HEAD_DIM * LLM_ELEM_SIZE);
-    const uint32_t src_row_stride = (uint32_t)(LLM_D_MODEL * LLM_ELEM_SIZE);
-    const uint32_t block_bytes = (uint32_t)BYTES_HM_HEAD;
+    const uint32_t row_bytes      = (uint32_t)(LLM_HEAD_DIM * LLM_ELEM_SIZE);  // 64*2=128B
+    const uint32_t src_row_stride = (uint32_t)(LLM_D_MODEL  * LLM_ELEM_SIZE);  // 1024*2=2048B
 
+    // L1 scratch
     uint32_t l1 = local(0);
     l1 = (l1 + 63) & ~((uint32_t)63);
 
-    uint64_t src = src_tm + (uint64_t)head * (uint64_t)row_bytes;
-    uint64_t dst = dst_hm_all + (uint64_t)head * (uint64_t)block_bytes;
+    // Token-major source starts at column offset for this head
+    // (token 0, column head*head_dim)
+    const uint64_t src_base = src_tm + (uint64_t)head * (uint64_t)row_bytes;
 
-    if (flex_is_dm_core())
+    // Head-major destination block for this head: [seq_len x head_dim]
+    const uint64_t dst_base = dst_hm + (uint64_t)head * (uint64_t)seq_len * (uint64_t)row_bytes;
+
+    uint32_t t0 = 0;
+    while (t0 < seq_len)
     {
-        // HBM (token-major slice) -> L1 contiguous [T, head_dim]
-        flex_dma_async_2d(
-            (uint64_t)l1,   // dst
-            src,            // src
-            row_bytes,      // size per row
-            row_bytes,      // dst stride
-            src_row_stride, // src stride
-            (uint32_t)LLM_T // repeat rows
-        );
-        flex_dma_async_wait_all();
+        uint32_t chunk_rows  = seq_len - t0;
+        if (chunk_rows > (uint32_t)LLM_PACK_CHUNK_ROWS) chunk_rows = (uint32_t)LLM_PACK_CHUNK_ROWS;
+        uint32_t chunk_bytes = chunk_rows * row_bytes;
 
-        // L1 -> HBM (head-major)
-        flex_dma_async_1d(dst, (uint64_t)l1, block_bytes);
-        flex_dma_async_wait_all();
+        // addresses for this chunk
+        uint64_t src = src_base + (uint64_t)t0 * (uint64_t)src_row_stride;
+        uint64_t dst = dst_base + (uint64_t)t0 * (uint64_t)row_bytes;
+
+        if (flex_is_dm_core())
+        {
+            // HBM (token-major slice) -> L1 contiguous [chunk_rows, head_dim]
+            flex_dma_async_2d(
+                (uint64_t)l1,       // dst (L1)
+                src,                // src (HBM)
+                row_bytes,          // size per row
+                row_bytes,          // dst stride (packed)
+                src_row_stride,     // src stride (next token row)
+                chunk_rows          // repeat
+            );
+            flex_dma_async_wait_all();
+
+            // L1 -> HBM (head-major) contiguous write
+            flex_dma_async_1d(dst, (uint64_t)l1, chunk_bytes);
+            flex_dma_async_wait_all();
+        }
+
+        flex_intra_cluster_sync();
+        t0 += chunk_rows;
     }
-    flex_intra_cluster_sync();
 }
 
 // =======================================================
 // Transform hm (head-major) to tm (token-major)
 // =======================================================
 
-static void llm_unpack_hm_to_tm(uint64_t src_hm_all, uint64_t dst_tm)
+static void llm_unpack_hm_to_tm(uint64_t src_hm, uint64_t dst_tm, uint32_t seq_len)
 {
     const uint32_t head = flex_get_cluster_id();
-    if (head >= (uint32_t)LLM_N_HEAD)
-        return;
+    if (head >= (uint32_t)LLM_N_HEAD || seq_len == 0) return;
 
-    const uint32_t row_bytes = (uint32_t)(LLM_HEAD_DIM * LLM_ELEM_SIZE);
-    const uint32_t dst_row_stride = (uint32_t)(LLM_D_MODEL * LLM_ELEM_SIZE);
-    const uint32_t block_bytes = (uint32_t)BYTES_HM_HEAD;
+    const uint32_t row_bytes      = (uint32_t)(LLM_HEAD_DIM * LLM_ELEM_SIZE);  // 128B
+    const uint32_t dst_row_stride = (uint32_t)(LLM_D_MODEL  * LLM_ELEM_SIZE);  // 2048B
 
+    // L1 scratch
     uint32_t l1 = local(0);
     l1 = (l1 + 63) & ~((uint32_t)63);
 
-    uint64_t src = src_hm_all + (uint64_t)head * (uint64_t)block_bytes;
-    uint64_t dst = dst_tm + (uint64_t)head * (uint64_t)row_bytes;
+    // Head-major source block for this head: [seq_len x head_dim]
+    const uint64_t src_base = src_hm + (uint64_t)head * (uint64_t)seq_len * (uint64_t)row_bytes;
 
-    if (flex_is_dm_core())
+    // Token-major destination starts at column offset for this head
+    const uint64_t dst_base = dst_tm + (uint64_t)head * (uint64_t)row_bytes;
+
+    uint32_t t0 = 0;
+    while (t0 < seq_len)
     {
-        // HBM (head-major) -> L1
-        flex_dma_async_1d((uint64_t)l1, src, block_bytes);
-        flex_dma_async_wait_all();
+        uint32_t chunk_rows  = seq_len - t0;
+        if (chunk_rows > (uint32_t)LLM_PACK_CHUNK_ROWS) chunk_rows = (uint32_t)LLM_PACK_CHUNK_ROWS;
+        uint32_t chunk_bytes = chunk_rows * row_bytes;
 
-        // L1 -> HBM (token-major scatter into columns of each row)
-        flex_dma_async_2d(
-            dst,            // dst (HBM token-major + column offset)
-            (uint64_t)l1,   // src (L1 contiguous)
-            row_bytes,      // size per row
-            dst_row_stride, // dst stride (next token row)
-            row_bytes,      // src stride (next packed row)
-            (uint32_t)LLM_T);
-        flex_dma_async_wait_all();
+        uint64_t src = src_base + (uint64_t)t0 * (uint64_t)row_bytes;
+        uint64_t dst = dst_base + (uint64_t)t0 * (uint64_t)dst_row_stride;
+
+        if (flex_is_dm_core())
+        {
+            // HBM (head-major) -> L1 contiguous
+            flex_dma_async_1d((uint64_t)l1, src, chunk_bytes);
+            flex_dma_async_wait_all();
+
+            // L1 -> HBM (token-major scatter into the correct columns each row)
+            flex_dma_async_2d(
+                dst,                // dst (HBM token-major + column offset)
+                (uint64_t)l1,       // src (L1 packed)
+                row_bytes,          // size per row
+                dst_row_stride,     // dst stride (next token row)
+                row_bytes,          // src stride (next packed row)
+                chunk_rows
+            );
+            flex_dma_async_wait_all();
+        }
+
+        flex_intra_cluster_sync();
+        t0 += chunk_rows;
     }
-    flex_intra_cluster_sync();
 }
 
 // =======================================================
@@ -457,7 +506,7 @@ static void llm_dma_dump_u16(uint64_t hbm_addr, uint32_t n_halfwords)
 //   - Writes AttnOut to LLM_ATTN_O_ADDR and adds it back to H
 //   - Runs MLP and adds MLP_out back to H
 //
-static void llm_layer_forward(int layer_id)
+static void llm_layer_forward(int layer_id, uint32_t q_len, uint32_t kv_len)
 {
 
     /*******************************************/
@@ -465,8 +514,8 @@ static void llm_layer_forward(int layer_id)
     /*******************************************/
 
     RMSNormInfo norm_attn_info = Dsv3RMSNormAnaylze(
-        (uint32_t)NORM_M_SIZE,
-        (uint32_t)NORM_N_SIZE,
+        (uint32_t)q_len,
+        (uint32_t)LLM_D_MODEL,
         (uint64_t)LLM_H_ADDR,     // input: H
         (uint64_t)LLM_H_NORM_ADDR // output: H_norm (for attention)
     );
@@ -510,7 +559,7 @@ static void llm_layer_forward(int layer_id)
 
     // --- Q = H_norm @ Wq  -> QKV_TM (scratch), then pack to Q_HM
     llm_run_gemm((uint64_t)LLM_H_NORM_ADDR, WQ, (uint64_t)LLM_QKV_TM_ADDR,
-                 (uint32_t)LLM_T, (uint32_t)LLM_D_MODEL, (uint32_t)LLM_D_MODEL);
+                 (uint32_t)q_len, (uint32_t)LLM_D_MODEL, (uint32_t)LLM_D_MODEL);
 
     // For debug
 #if LLM_DEBUG_DUMP
@@ -519,7 +568,7 @@ static void llm_layer_forward(int layer_id)
 #endif
 
     flex_global_barrier_xy();
-    llm_pack_tm_to_hm((uint64_t)LLM_QKV_TM_ADDR, (uint64_t)LLM_Q_HM_ADDR);
+    llm_pack_tm_to_hm((uint64_t)LLM_QKV_TM_ADDR, (uint64_t)LLM_Q_HM_ADDR, (uint32_t)q_len);
     flex_global_barrier_xy();
 
     // For debug
@@ -529,22 +578,22 @@ static void llm_layer_forward(int layer_id)
 
     // --- K
     llm_run_gemm((uint64_t)LLM_H_NORM_ADDR, WK, (uint64_t)LLM_QKV_TM_ADDR,
-                 (uint32_t)LLM_T, (uint32_t)LLM_D_MODEL, (uint32_t)LLM_D_MODEL);
+                 (uint32_t)kv_len, (uint32_t)LLM_D_MODEL, (uint32_t)LLM_D_MODEL);
     flex_global_barrier_xy();
-    llm_pack_tm_to_hm((uint64_t)LLM_QKV_TM_ADDR, (uint64_t)LLM_K_HM_ADDR);
+    llm_pack_tm_to_hm((uint64_t)LLM_QKV_TM_ADDR, (uint64_t)LLM_K_HM_ADDR, (uint32_t)kv_len);
     flex_global_barrier_xy();
 
     // --- V
     llm_run_gemm((uint64_t)LLM_H_NORM_ADDR, WV, (uint64_t)LLM_QKV_TM_ADDR,
-                 (uint32_t)LLM_T, (uint32_t)LLM_D_MODEL, (uint32_t)LLM_D_MODEL);
+                 (uint32_t)kv_len, (uint32_t)LLM_D_MODEL, (uint32_t)LLM_D_MODEL);
     flex_global_barrier_xy();
-    llm_pack_tm_to_hm((uint64_t)LLM_QKV_TM_ADDR, (uint64_t)LLM_V_HM_ADDR);
+    llm_pack_tm_to_hm((uint64_t)LLM_QKV_TM_ADDR, (uint64_t)LLM_V_HM_ADDR, (uint32_t)kv_len);
     flex_global_barrier_xy();
 
     // --- flat_attention on head-major buffers: O_HM
     int attn_status = flat_attention(
-        (uint32_t)ATTN_KV_SEQUENCE_LENGTH,
-        (uint32_t)ATTN_Q_SEQUENCE_LENGTH,
+        (uint32_t)kv_len,
+        (uint32_t)q_len,
         (uint32_t)ATTN_SPECULATIVE_LENGTH,
         (uint32_t)ATTN_HEAD_DIMEMSION,
         (uint32_t)ATTN_NUM_HEAD,
@@ -564,12 +613,12 @@ static void llm_layer_forward(int layer_id)
 
     flex_global_barrier_xy();
     // --- unpack O_HM -> O_TM (LLM_ATTN_O_ADDR)
-    llm_unpack_hm_to_tm((uint64_t)LLM_O_HM_ADDR, (uint64_t)LLM_ATTN_O_ADDR);
+    llm_unpack_hm_to_tm((uint64_t)LLM_O_HM_ADDR, (uint64_t)LLM_ATTN_O_ADDR, (uint32_t)q_len);
     flex_global_barrier_xy();
 
     // --- AttnProj = O_TM @ Wo -> reuse MLP_OUT as projection buffer
     llm_run_gemm((uint64_t)LLM_ATTN_O_ADDR, WO, (uint64_t)LLM_ATTN_PROJ_TM_ADDR,
-                 (uint32_t)LLM_T, (uint32_t)LLM_D_MODEL, (uint32_t)LLM_D_MODEL);
+                 (uint32_t)q_len, (uint32_t)LLM_D_MODEL, (uint32_t)LLM_D_MODEL);
     flex_global_barrier_xy();
 
     // For debug
@@ -597,7 +646,7 @@ static void llm_layer_forward(int layer_id)
         flex_timer_start();
     flex_global_barrier_xy();
 
-    llm_residual_add_spatz((uint64_t)LLM_H_ADDR, (uint64_t)LLM_ATTN_PROJ_TM_ADDR);
+    llm_residual_add_spatz((uint64_t)LLM_H_ADDR, (uint64_t)LLM_ATTN_PROJ_TM_ADDR, q_len, (uint32_t)LLM_D_MODEL);
 
     flex_global_barrier_xy();
     if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
@@ -615,8 +664,8 @@ static void llm_layer_forward(int layer_id)
 
     flex_global_barrier_xy();
     RMSNormInfo norm_mlp_info = Dsv3RMSNormAnaylze(
-        (uint32_t)NORM_M_SIZE,
-        (uint32_t)NORM_N_SIZE,
+        (uint32_t)q_len,
+        (uint32_t)LLM_D_MODEL,
         (uint64_t)LLM_H_ADDR,     // input: H after attention
         (uint64_t)LLM_H_NORM_ADDR // output: H_norm for MLP
     );
@@ -661,9 +710,9 @@ static void llm_layer_forward(int layer_id)
         (uint64_t)LLM_GEMM1_X_ADDR, // X_address (H_norm)
         (uint64_t)W1,               // W_address (MLP up weights)
         (uint64_t)LLM_GEMM1_Z_ADDR, // Z_address (MLP_mid)
-        (uint32_t)GEMM_M_SIZE,
-        (uint32_t)GEMM_N_SIZE,
-        (uint32_t)GEMM_K_SIZE, // shared dimension
+        (uint32_t)q_len,
+        (uint32_t)LLM_D_FF,
+        (uint32_t)LLM_D_MODEL, // shared dimension
         (uint32_t)GEMM_M_TILE,
         (uint32_t)GEMM_N_TILE,
         (uint32_t)GEMM_K_TILE,
@@ -704,8 +753,8 @@ static void llm_layer_forward(int layer_id)
 
     flex_global_barrier_xy();
     ActivationInfo act_info = ActivationAnaylze(
-        (uint32_t)ACTI_M_SIZE,          // num_total_token
-        (uint32_t)ACTI_N_SIZE,          // token_embedded_length
+        (uint32_t)q_len,          // num_total_token
+        (uint32_t)LLM_D_FF,          // token_embedded_length
         (uint32_t)ACTI_GATE_ENABLE,     // gate_enable
         (uint32_t)ACTI_BIAS_ENABLE,     // bias_enable
         (uint64_t)LLM_ACTI_INPUT_ADDR,  // input_address
@@ -748,7 +797,7 @@ static void llm_layer_forward(int layer_id)
         (uint64_t)LLM_GEMM2_X_ADDR,
         (uint64_t)W2,
         (uint64_t)LLM_GEMM2_Z_ADDR,
-        (uint32_t)LLM_T,       // 128
+        (uint32_t)q_len,       // 128
         (uint32_t)LLM_D_MODEL, // 1024
         (uint32_t)LLM_D_FF,    // 4096
         (uint32_t)GEMM_M_TILE,
@@ -795,7 +844,7 @@ static void llm_layer_forward(int layer_id)
 
     flex_global_barrier_xy();
     // MLP residual: H = H + MLP_out
-    llm_residual_add_spatz((uint64_t)LLM_H_ADDR, (uint64_t)LLM_MLP_OUT_ADDR);
+    llm_residual_add_spatz((uint64_t)LLM_H_ADDR, (uint64_t)LLM_MLP_OUT_ADDR, q_len, (uint32_t)LLM_D_MODEL);
 
     flex_global_barrier_xy();
     if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
@@ -811,6 +860,9 @@ static void llm_layer_forward(int layer_id)
 int main()
 {
     uint32_t eoc_val = 0;
+
+    uint32_t q_len  = (uint32_t)LLM_T;
+    uint32_t kv_len = (uint32_t)LLM_T;
 
     // Initialize XY barriers for the Flex clusters and cores.
     flex_barrier_xy_init();
@@ -842,7 +894,7 @@ int main()
             flex_timer_start();
         flex_global_barrier_xy();
 
-        llm_layer_forward(layer);
+        llm_layer_forward(layer, q_len, kv_len);
 
         flex_global_barrier_xy();
         if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
