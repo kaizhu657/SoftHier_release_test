@@ -22,21 +22,21 @@ class FlatAttetion:
 
         #Attention parameters
         self.dtype                   = 'fp16'
-        self.kv_sequence_length      = 512
-        self.q_sequence_length       = 512
+        self.kv_sequence_length      = 2048
+        self.q_sequence_length       = 2048
         self.speculative_length      = 1
         self.head_dimemsion          = 128
-        self.num_head                = 32
-        self.num_head_group          = 32
+        self.num_head                = 6
+        self.num_head_group          = 6
         self.batch_size              = 1
 
         #Flatten Settings
         ## [Scale]: How many clusters (x=scale, y=scale) are assigned for one head.
         ##          For a set of clusters (x=scale, y=scale) we would call it **Group**
-        self.flatten_scale_x         = 4
-        self.flatten_scale_y         = 4
+        self.flatten_scale_x         = 8
+        self.flatten_scale_y         = 8
         ## [Shape]: Attention matrix shape (x=shape, y=shape) that a Group need to handle for each iteration
-        self.flatten_shape_x         = 512
-        self.flatten_shape_y         = 512
+        self.flatten_shape_x         = 1024
+        self.flatten_shape_y         = 1024
         ## [Async]: Whether to enable asynchronous execution
-        self.flatten_async           = 1
+        self.flatten_async           = 0
