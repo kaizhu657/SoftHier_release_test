@@ -412,17 +412,24 @@ static void llm_unpack_hm_to_tm(uint64_t src_hm, uint64_t dst_tm, uint32_t seq_l
     }
 }
 
-static void llm_store_hm_to_kv_cache(uint64_t src_hm_addr, uint64_t dst_layer_base, uint32_t kv_len)
+static void llm_store_hm_to_kv_cache(uint64_t src_hm_addr,
+                                     uint64_t dst_layer_base,
+                                     uint32_t token_offset,
+                                     uint32_t seq_len)
 {
+    if (seq_len == 0)
+        return;
+
     const uint32_t row_bytes = (uint32_t)(LLM_HEAD_DIM * LLM_ELEM_SIZE);
-    const uint32_t src_head_bytes = kv_len * row_bytes;
+    const uint32_t src_head_bytes = seq_len * row_bytes;
+    const uint64_t dst_token_off = (uint64_t)token_offset * (uint64_t)row_bytes;
 
     for (uint32_t kv_head = flex_get_cluster_id();
          kv_head < (uint32_t)LLM_N_KV_HEAD;
          kv_head += ARCH_NUM_CLUSTER)
     {
         const uint64_t src = src_hm_addr + (uint64_t)kv_head * (uint64_t)src_head_bytes;
-        const uint64_t dst = dst_layer_base + (uint64_t)kv_head * (uint64_t)BYTES_KV_HEAD_CTX;
+        const uint64_t dst = dst_layer_base + (uint64_t)kv_head * (uint64_t)BYTES_KV_HEAD_CTX + dst_token_off;
 
         if (flex_is_dm_core())
         {
@@ -752,9 +759,30 @@ void llm_common_store_prefill_kv_cache(uint32_t layer_id, uint32_t kv_len)
         kv_len = (uint32_t)LLM_MAX_CTX;
 
     flex_global_barrier_xy();
-    llm_store_hm_to_kv_cache((uint64_t)LLM_K_HM_ADDR, llm_k_cache_layer_base(layer_id), kv_len);
+    llm_store_hm_to_kv_cache((uint64_t)LLM_K_HM_ADDR, llm_k_cache_layer_base(layer_id), 0u, kv_len);
     flex_global_barrier_xy();
-    llm_store_hm_to_kv_cache((uint64_t)LLM_V_HM_ADDR, llm_v_cache_layer_base(layer_id), kv_len);
+    llm_store_hm_to_kv_cache((uint64_t)LLM_V_HM_ADDR, llm_v_cache_layer_base(layer_id), 0u, kv_len);
+    flex_global_barrier_xy();
+}
+
+void llm_common_store_decode_kv_cache(uint32_t layer_id, uint32_t cache_pos, uint32_t append_len)
+{
+    if (!llm_cache_valid_layer(layer_id) || append_len == 0)
+        return;
+
+    if (cache_pos >= (uint32_t)LLM_MAX_CTX)
+        return;
+
+    if (!llm_cache_can_append(cache_pos, append_len, (uint32_t)LLM_MAX_CTX))
+        append_len = (uint32_t)LLM_MAX_CTX - cache_pos;
+
+    if (append_len == 0)
+        return;
+
+    flex_global_barrier_xy();
+    llm_store_hm_to_kv_cache((uint64_t)LLM_K_HM_ADDR, llm_k_cache_layer_base(layer_id), cache_pos, append_len);
+    flex_global_barrier_xy();
+    llm_store_hm_to_kv_cache((uint64_t)LLM_V_HM_ADDR, llm_v_cache_layer_base(layer_id), cache_pos, append_len);
     flex_global_barrier_xy();
 }
 
