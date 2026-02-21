@@ -33,6 +33,8 @@ void llm_common_init_dummy_weights(uint32_t layer_id);
 // Layer primitives used by prefill/decode applications.
 void llm_common_run_prefill_layer(uint32_t layer_id, uint32_t q_len, uint32_t kv_len);
 void llm_common_run_decode_layer(uint32_t layer_id, uint32_t q_len, uint32_t kv_len);
+// Persist the current layer K/V tensors into shared KV cache layout.
+void llm_common_store_prefill_kv_cache(uint32_t layer_id, uint32_t kv_len);
 
 // Debug utility: dump fp16 values from HBM.
 void llm_common_dma_dump_u16(uint64_t hbm_addr, uint32_t n_halfwords);

@@ -412,6 +412,27 @@ static void llm_unpack_hm_to_tm(uint64_t src_hm, uint64_t dst_tm, uint32_t seq_l
     }
 }
 
+static void llm_store_hm_to_kv_cache(uint64_t src_hm_addr, uint64_t dst_layer_base, uint32_t kv_len)
+{
+    const uint32_t row_bytes = (uint32_t)(LLM_HEAD_DIM * LLM_ELEM_SIZE);
+    const uint32_t src_head_bytes = kv_len * row_bytes;
+
+    for (uint32_t kv_head = flex_get_cluster_id();
+         kv_head < (uint32_t)LLM_N_KV_HEAD;
+         kv_head += ARCH_NUM_CLUSTER)
+    {
+        const uint64_t src = src_hm_addr + (uint64_t)kv_head * (uint64_t)src_head_bytes;
+        const uint64_t dst = dst_layer_base + (uint64_t)kv_head * (uint64_t)BYTES_KV_HEAD_CTX;
+
+        if (flex_is_dm_core())
+        {
+            flex_dma_async_1d(dst, src, src_head_bytes);
+            flex_dma_async_wait_all();
+        }
+        flex_intra_cluster_sync();
+    }
+}
+
 static void llm_run_gemm(uint64_t X, uint64_t W, uint64_t Z,
                          uint32_t M, uint32_t N, uint32_t K)
 {
@@ -720,6 +741,21 @@ void llm_common_run_prefill_layer(uint32_t layer_id, uint32_t q_len, uint32_t kv
 {
     // Prefill currently reuses the shared transformer layer primitive.
     llm_run_transformer_layer(layer_id, q_len, kv_len);
+}
+
+void llm_common_store_prefill_kv_cache(uint32_t layer_id, uint32_t kv_len)
+{
+    if (!llm_cache_valid_layer(layer_id) || kv_len == 0)
+        return;
+
+    if (kv_len > (uint32_t)LLM_MAX_CTX)
+        kv_len = (uint32_t)LLM_MAX_CTX;
+
+    flex_global_barrier_xy();
+    llm_store_hm_to_kv_cache((uint64_t)LLM_K_HM_ADDR, llm_k_cache_layer_base(layer_id), kv_len);
+    flex_global_barrier_xy();
+    llm_store_hm_to_kv_cache((uint64_t)LLM_V_HM_ADDR, llm_v_cache_layer_base(layer_id), kv_len);
+    flex_global_barrier_xy();
 }
 
 void llm_common_run_decode_layer(uint32_t layer_id, uint32_t q_len, uint32_t kv_len)
