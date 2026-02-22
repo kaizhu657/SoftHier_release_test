@@ -112,6 +112,57 @@ uint32_t llm_common_cache_append(LLMRuntimeState *state, uint32_t append_tokens)
     return 1u;
 }
 
+void llm_common_attn_profile_default(LLMAttentionRuntimeArgs *args)
+{
+    if (args == 0)
+        return;
+
+    // Keep attn.h as baseline defaults; apps can override selected fields.
+    args->speculative_length = (uint32_t)ATTN_SPECULATIVE_LENGTH;
+    args->head_dimension = (uint32_t)ATTN_HEAD_DIMEMSION;
+    args->num_head = (uint32_t)ATTN_NUM_HEAD;
+    args->num_head_group = (uint32_t)ATTN_NUM_HEAD_GROUP;
+    args->batch_size = (uint32_t)ATTN_BATCH_SIZE;
+    args->flatten_scale_x = (uint32_t)ATTN_FLATTEN_SCALE_X;
+    args->flatten_scale_y = (uint32_t)ATTN_FLATTEN_SCALE_Y;
+    args->flatten_shape_x = (uint32_t)ATTN_FLATTEN_SHAPE_X;
+    args->flatten_shape_y = (uint32_t)ATTN_FLATTEN_SHAPE_Y;
+    args->async_enable = (uint32_t)ATTN_FLATTEN_ASYNC;
+    args->dump_enable = 0u;
+}
+
+static LLMAttentionRuntimeArgs llm_common_resolve_attn_args(const LLMAttentionRuntimeArgs *attn_args)
+{
+    LLMAttentionRuntimeArgs cfg;
+    // Always start from defaults so partially overridden profiles stay valid.
+    llm_common_attn_profile_default(&cfg);
+    if (attn_args != 0)
+        cfg = *attn_args;
+    return cfg;
+}
+
+static uint32_t llm_common_attn_args_valid(const LLMAttentionRuntimeArgs *cfg)
+{
+    // Lightweight guards before calling flat_attention().
+    if (cfg == 0)
+        return 0u;
+    if (cfg->speculative_length == 0u || cfg->head_dimension == 0u)
+        return 0u;
+    if (cfg->num_head == 0u || cfg->num_head_group == 0u || cfg->batch_size == 0u)
+        return 0u;
+    if (cfg->num_head_group > cfg->num_head)
+        return 0u;
+    if (cfg->flatten_scale_x == 0u || cfg->flatten_scale_y == 0u)
+        return 0u;
+    if (cfg->flatten_shape_x == 0u || cfg->flatten_shape_y == 0u)
+        return 0u;
+    if ((cfg->flatten_shape_x % cfg->flatten_scale_x) != 0u)
+        return 0u;
+    if ((cfg->flatten_shape_y % cfg->flatten_scale_y) != 0u)
+        return 0u;
+    return 1u;
+}
+
 void llm_common_barrier_init(void)
 {
     flex_barrier_xy_init();
@@ -424,6 +475,7 @@ static void llm_store_hm_to_kv_cache(uint64_t src_hm_addr,
     const uint32_t src_head_bytes = seq_len * row_bytes;
     const uint64_t dst_token_off = (uint64_t)token_offset * (uint64_t)row_bytes;
 
+    // KV cache layout is [kv_head][token][head_dim]; each cluster handles head stripes.
     for (uint32_t kv_head = flex_get_cluster_id();
          kv_head < (uint32_t)LLM_N_KV_HEAD;
          kv_head += ARCH_NUM_CLUSTER)
@@ -501,8 +553,14 @@ void llm_common_dma_dump_u16(uint64_t hbm_addr, uint32_t n_halfwords)
     flex_global_barrier_xy();
 }
 
-static void llm_run_transformer_layer(uint32_t layer_id, uint32_t q_len, uint32_t kv_len)
+static void llm_run_transformer_layer(uint32_t layer_id,
+                                      uint32_t q_len,
+                                      uint32_t kv_len,
+                                      const LLMAttentionRuntimeArgs *attn_args)
 {
+    // Resolve per-phase runtime profile (prefill/decode) for attention call.
+    const LLMAttentionRuntimeArgs attn_cfg = llm_common_resolve_attn_args(attn_args);
+
     // 1) Pre-attention RMSNorm.
     RMSNormInfo norm_attn_info = Dsv3RMSNormAnaylze(
         (uint32_t)q_len,
@@ -554,25 +612,35 @@ static void llm_run_transformer_layer(uint32_t layer_id, uint32_t q_len, uint32_
     llm_pack_tm_to_hm((uint64_t)LLM_QKV_TM_ADDR, (uint64_t)LLM_V_HM_ADDR, (uint32_t)kv_len);
     flex_global_barrier_xy();
 
-    int attn_status = flat_attention(
-        (uint32_t)kv_len,
-        (uint32_t)q_len,
-        (uint32_t)ATTN_SPECULATIVE_LENGTH,
-        (uint32_t)ATTN_HEAD_DIMEMSION,
-        (uint32_t)ATTN_NUM_HEAD,
-        (uint32_t)ATTN_NUM_HEAD_GROUP,
-        (uint32_t)ATTN_BATCH_SIZE,
-        (uint32_t)ATTN_FLATTEN_SCALE_X,
-        (uint32_t)ATTN_FLATTEN_SCALE_Y,
-        (uint32_t)ATTN_FLATTEN_SHAPE_X,
-        (uint32_t)ATTN_FLATTEN_SHAPE_Y,
-        (uint64_t)LLM_Q_HM_ADDR,
-        (uint64_t)LLM_K_HM_ADDR,
-        (uint64_t)LLM_V_HM_ADDR,
-        (uint64_t)LLM_O_HM_ADDR,
-        (uint64_t)0,
-        (uint32_t)ATTN_FLATTEN_ASYNC,
-        (uint32_t)0);
+    int attn_status = 1;
+    if (llm_common_attn_args_valid(&attn_cfg))
+    {
+        // Runtime profile replaces compile-time ATTN_* constants here.
+        attn_status = flat_attention(
+            (uint32_t)kv_len,
+            (uint32_t)q_len,
+            (uint32_t)attn_cfg.speculative_length,
+            (uint32_t)attn_cfg.head_dimension,
+            (uint32_t)attn_cfg.num_head,
+            (uint32_t)attn_cfg.num_head_group,
+            (uint32_t)attn_cfg.batch_size,
+            (uint32_t)attn_cfg.flatten_scale_x,
+            (uint32_t)attn_cfg.flatten_scale_y,
+            (uint32_t)attn_cfg.flatten_shape_x,
+            (uint32_t)attn_cfg.flatten_shape_y,
+            (uint64_t)LLM_Q_HM_ADDR,
+            (uint64_t)LLM_K_HM_ADDR,
+            (uint64_t)LLM_V_HM_ADDR,
+            (uint64_t)LLM_O_HM_ADDR,
+            (uint64_t)0,
+            (uint32_t)attn_cfg.async_enable,
+            (uint32_t)attn_cfg.dump_enable);
+    }
+    else if (llm_common_is_lead_core())
+    {
+        // Keep run alive for debugging but mark the layer as invalid profile.
+        printf("[LLMForward] invalid runtime attention profile\n");
+    }
 
     flex_global_barrier_xy();
     llm_unpack_hm_to_tm((uint64_t)LLM_O_HM_ADDR, (uint64_t)LLM_ATTN_O_ADDR, (uint32_t)q_len);
@@ -744,10 +812,13 @@ static void llm_run_transformer_layer(uint32_t layer_id, uint32_t q_len, uint32_
         printf("[LLMForward] Layer %u: 8 -- MLP residual applied\n", layer_id);
 }
 
-void llm_common_run_prefill_layer(uint32_t layer_id, uint32_t q_len, uint32_t kv_len)
+void llm_common_run_prefill_layer(uint32_t layer_id,
+                                  uint32_t q_len,
+                                  uint32_t kv_len,
+                                  const LLMAttentionRuntimeArgs *attn_args)
 {
     // Prefill currently reuses the shared transformer layer primitive.
-    llm_run_transformer_layer(layer_id, q_len, kv_len);
+    llm_run_transformer_layer(layer_id, q_len, kv_len, attn_args);
 }
 
 void llm_common_store_prefill_kv_cache(uint32_t layer_id, uint32_t kv_len)
@@ -755,6 +826,7 @@ void llm_common_store_prefill_kv_cache(uint32_t layer_id, uint32_t kv_len)
     if (!llm_cache_valid_layer(layer_id) || kv_len == 0)
         return;
 
+    // Prefill writes the full prompt window starting at cache token 0.
     if (kv_len > (uint32_t)LLM_MAX_CTX)
         kv_len = (uint32_t)LLM_MAX_CTX;
 
@@ -773,6 +845,7 @@ void llm_common_store_decode_kv_cache(uint32_t layer_id, uint32_t cache_pos, uin
     if (cache_pos >= (uint32_t)LLM_MAX_CTX)
         return;
 
+    // Decode appends only the newly generated token slice at cache_pos.
     if (!llm_cache_can_append(cache_pos, append_len, (uint32_t)LLM_MAX_CTX))
         append_len = (uint32_t)LLM_MAX_CTX - cache_pos;
 
@@ -786,8 +859,11 @@ void llm_common_store_decode_kv_cache(uint32_t layer_id, uint32_t cache_pos, uin
     flex_global_barrier_xy();
 }
 
-void llm_common_run_decode_layer(uint32_t layer_id, uint32_t q_len, uint32_t kv_len)
+void llm_common_run_decode_layer(uint32_t layer_id,
+                                 uint32_t q_len,
+                                 uint32_t kv_len,
+                                 const LLMAttentionRuntimeArgs *attn_args)
 {
     // Decode currently uses the same primitive; cache-specialized path comes later.
-    llm_run_transformer_layer(layer_id, q_len, kv_len);
+    llm_run_transformer_layer(layer_id, q_len, kv_len, attn_args);
 }

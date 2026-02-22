@@ -5,12 +5,15 @@
 int main()
 {
     uint32_t eoc_val = 0;
+    LLMAttentionRuntimeArgs attn_profile;
 
     uint32_t q_len = (uint32_t)LLM_T;
     uint32_t kv_len = (uint32_t)LLM_T;
 
     LLMRuntimeState state;
     llm_common_init_runtime(&state, q_len, 0, (uint32_t)LLM_MAX_CTX);
+    // Legacy app sticks to default attention profile for compatibility.
+    llm_common_attn_profile_default(&attn_profile);
 
     llm_common_barrier_init();
 
@@ -33,7 +36,7 @@ int main()
         llm_common_timer_start();
         llm_common_barrier();
 
-        llm_common_run_prefill_layer(layer, q_len, kv_len);
+        llm_common_run_prefill_layer(layer, q_len, kv_len, &attn_profile);
 
         llm_common_barrier();
         if (llm_common_is_lead_core())

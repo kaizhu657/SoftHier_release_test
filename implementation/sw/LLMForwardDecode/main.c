@@ -4,12 +4,26 @@
 int main()
 {
     uint32_t eoc_val = 0;
+    LLMAttentionRuntimeArgs decode_attn;
 
     LLMRuntimeState state;
     llm_common_init_runtime(&state,
                             0u,
                             (uint32_t)LLM_DECODE_STEPS,
                             (uint32_t)LLM_MAX_CTX);
+    // Start from defaults, then apply decode-specific q_len=1-safe overrides.
+    llm_common_attn_profile_default(&decode_attn);
+    decode_attn.speculative_length = (uint32_t)LLM_DECODE_ATTN_SPECULATIVE_LENGTH;
+    decode_attn.head_dimension = (uint32_t)LLM_DECODE_ATTN_HEAD_DIM;
+    decode_attn.num_head = (uint32_t)LLM_DECODE_ATTN_NUM_HEAD;
+    decode_attn.num_head_group = (uint32_t)LLM_DECODE_ATTN_NUM_HEAD_GROUP;
+    decode_attn.batch_size = (uint32_t)LLM_DECODE_ATTN_BATCH_SIZE;
+    decode_attn.flatten_scale_x = (uint32_t)LLM_DECODE_ATTN_FLATTEN_SCALE_X;
+    decode_attn.flatten_scale_y = (uint32_t)LLM_DECODE_ATTN_FLATTEN_SCALE_Y;
+    decode_attn.flatten_shape_x = (uint32_t)LLM_DECODE_ATTN_FLATTEN_SHAPE_X;
+    decode_attn.flatten_shape_y = (uint32_t)LLM_DECODE_ATTN_FLATTEN_SHAPE_Y;
+    decode_attn.async_enable = (uint32_t)LLM_DECODE_ATTN_ASYNC_ENABLE;
+    decode_attn.dump_enable = (uint32_t)LLM_DECODE_ATTN_DUMP_ENABLE;
 
     llm_common_barrier_init();
     llm_common_barrier();
@@ -49,12 +63,14 @@ int main()
             break;
         }
 
+        // Current step attends to all cached tokens plus the new query token.
         const uint32_t kv_len = state.cache_len + 1u;
 
         for (uint32_t layer = 0; layer < (uint32_t)LLM_NUM_LAYERS; ++layer)
         {
             llm_common_barrier();
-            llm_common_run_decode_layer(layer, 1u, kv_len);
+            // Decode executes one query token against growing KV context.
+            llm_common_run_decode_layer(layer, 1u, kv_len, &decode_attn);
             llm_common_store_decode_kv_cache(layer, state.cache_len, 1u);
             llm_common_log_layer_done(layer);
         }
