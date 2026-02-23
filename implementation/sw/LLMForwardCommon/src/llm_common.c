@@ -812,6 +812,296 @@ static void llm_run_transformer_layer(uint32_t layer_id,
         printf("[LLMForward] Layer %u: 8 -- MLP residual applied\n", layer_id);
 }
 
+static void llm_run_transformer_layer_decode_cached(uint32_t layer_id,
+                                                    uint32_t q_len,
+                                                    uint32_t kv_len,
+                                                    const LLMAttentionRuntimeArgs *attn_args)
+{
+    // Decode: run attention against persistent KV cache (NanoChat-like behavior).
+    const LLMAttentionRuntimeArgs attn_cfg = llm_common_resolve_attn_args(attn_args);
+
+    if (!llm_cache_valid_layer(layer_id))
+        return;
+    if (q_len == 0u || kv_len == 0u)
+        return;
+
+    if (kv_len > (uint32_t)LLM_MAX_CTX)
+        kv_len = (uint32_t)LLM_MAX_CTX;
+    if (q_len > kv_len)
+        q_len = kv_len;
+    if (q_len == 0u)
+        return;
+
+    // Decode appends q_len new K/V tokens at the end of the existing cache prefix.
+    uint32_t append_len = q_len;
+    uint32_t cache_pos = kv_len - append_len;
+
+    if (!llm_cache_can_append(cache_pos, append_len, (uint32_t)LLM_MAX_CTX))
+    {
+        append_len = (uint32_t)LLM_MAX_CTX - cache_pos;
+        if (append_len == 0u)
+            return;
+        if (q_len > append_len)
+            q_len = append_len;
+        kv_len = cache_pos + append_len;
+    }
+
+    // 1) Pre-attention RMSNorm on decode query tokens.
+    RMSNormInfo norm_attn_info = Dsv3RMSNormAnaylze(
+        (uint32_t)q_len,
+        (uint32_t)LLM_D_MODEL,
+        (uint64_t)LLM_H_ADDR,
+        (uint64_t)LLM_H_NORM_ADDR);
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        flex_timer_start();
+    flex_global_barrier_xy();
+
+    Dsv3RMSNormRun(&norm_attn_info);
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        flex_timer_end();
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        printf("[LLMForward] Layer %u: 1 -- Pre-Attn RMSNorm\n", layer_id);
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        flex_timer_start();
+    flex_global_barrier_xy();
+
+    uint64_t WQ = llm_wq_addr(layer_id);
+    uint64_t WK = llm_wk_addr(layer_id);
+    uint64_t WV = llm_wv_addr(layer_id);
+    uint64_t WO = llm_wo_addr(layer_id);
+
+    // 2) Attention path:
+    //    - Q from decode query tokens
+    //    - K/V only for newly appended tokens
+    //    - append new K/V into persistent cache
+    //    - run attention against cached K/V address space
+    llm_run_gemm((uint64_t)LLM_H_NORM_ADDR, WQ, (uint64_t)LLM_QKV_TM_ADDR,
+                 (uint32_t)q_len, (uint32_t)LLM_D_MODEL, (uint32_t)LLM_D_MODEL);
+    flex_global_barrier_xy();
+    llm_pack_tm_to_hm((uint64_t)LLM_QKV_TM_ADDR, (uint64_t)LLM_Q_HM_ADDR, (uint32_t)q_len);
+    flex_global_barrier_xy();
+
+    llm_run_gemm((uint64_t)LLM_H_NORM_ADDR, WK, (uint64_t)LLM_QKV_TM_ADDR,
+                 (uint32_t)append_len, (uint32_t)LLM_D_MODEL, (uint32_t)LLM_D_MODEL);
+    flex_global_barrier_xy();
+    llm_pack_tm_to_hm((uint64_t)LLM_QKV_TM_ADDR, (uint64_t)LLM_K_HM_ADDR, (uint32_t)append_len);
+    flex_global_barrier_xy();
+
+    llm_run_gemm((uint64_t)LLM_H_NORM_ADDR, WV, (uint64_t)LLM_QKV_TM_ADDR,
+                 (uint32_t)append_len, (uint32_t)LLM_D_MODEL, (uint32_t)LLM_D_MODEL);
+    flex_global_barrier_xy();
+    llm_pack_tm_to_hm((uint64_t)LLM_QKV_TM_ADDR, (uint64_t)LLM_V_HM_ADDR, (uint32_t)append_len);
+    flex_global_barrier_xy();
+
+    // Materialize this decode step's K/V into persistent cache before attention.
+    llm_common_store_decode_kv_cache(layer_id, cache_pos, append_len);
+
+    int attn_status = 1;
+    if (llm_common_attn_args_valid(&attn_cfg))
+    {
+        attn_status = flat_attention(
+            (uint32_t)kv_len,
+            (uint32_t)q_len,
+            (uint32_t)attn_cfg.speculative_length,
+            (uint32_t)attn_cfg.head_dimension,
+            (uint32_t)attn_cfg.num_head,
+            (uint32_t)attn_cfg.num_head_group,
+            (uint32_t)attn_cfg.batch_size,
+            (uint32_t)attn_cfg.flatten_scale_x,
+            (uint32_t)attn_cfg.flatten_scale_y,
+            (uint32_t)attn_cfg.flatten_shape_x,
+            (uint32_t)attn_cfg.flatten_shape_y,
+            (uint64_t)LLM_Q_HM_ADDR,
+            llm_k_cache_layer_base(layer_id),
+            llm_v_cache_layer_base(layer_id),
+            (uint64_t)LLM_O_HM_ADDR,
+            (uint64_t)0,
+            (uint32_t)attn_cfg.async_enable,
+            (uint32_t)attn_cfg.dump_enable);
+    }
+    else if (llm_common_is_lead_core())
+    {
+        printf("[LLMForward] invalid runtime attention profile\n");
+    }
+
+    flex_global_barrier_xy();
+    llm_unpack_hm_to_tm((uint64_t)LLM_O_HM_ADDR, (uint64_t)LLM_ATTN_O_ADDR, (uint32_t)q_len);
+    flex_global_barrier_xy();
+
+    llm_run_gemm((uint64_t)LLM_ATTN_O_ADDR, WO, (uint64_t)LLM_ATTN_PROJ_TM_ADDR,
+                 (uint32_t)q_len, (uint32_t)LLM_D_MODEL, (uint32_t)LLM_D_MODEL);
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        flex_timer_end();
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        printf("[LLMForward] Layer %u: Attention status=%d\n", layer_id, attn_status);
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        flex_timer_start();
+    flex_global_barrier_xy();
+
+    // 3) Residual add: H <- H + AttentionOut.
+    llm_residual_add_spatz((uint64_t)LLM_H_ADDR, (uint64_t)LLM_ATTN_PROJ_TM_ADDR, q_len, (uint32_t)LLM_D_MODEL);
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        flex_timer_end();
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        printf("[LLMForward] Layer %u: Attention residual applied (proj)\n", layer_id);
+
+    // 4) Pre-MLP RMSNorm.
+    RMSNormInfo norm_mlp_info = Dsv3RMSNormAnaylze(
+        (uint32_t)q_len,
+        (uint32_t)LLM_D_MODEL,
+        (uint64_t)LLM_H_ADDR,
+        (uint64_t)LLM_H_NORM_ADDR);
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        flex_timer_start();
+    flex_global_barrier_xy();
+
+    Dsv3RMSNormRun(&norm_mlp_info);
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        flex_timer_end();
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        printf("[LLMForward] Layer %u: 4 -- Pre-MLP RMSNorm\n", layer_id);
+
+    // 5) MLP up-projection.
+    uint64_t W1 = llm_w1_up_addr(layer_id);
+    SummaGEMMInfo gemm1_info = SummaGEMMAnaylze(
+        (uint64_t)LLM_GEMM1_X_ADDR,
+        (uint64_t)W1,
+        (uint64_t)LLM_GEMM1_Z_ADDR,
+        (uint32_t)q_len,
+        (uint32_t)LLM_D_FF,
+        (uint32_t)LLM_D_MODEL,
+        (uint32_t)GEMM_M_TILE,
+        (uint32_t)GEMM_N_TILE,
+        (uint32_t)GEMM_K_TILE,
+        (uint32_t)GEMM_SUMMA_SCALE_X,
+        (uint32_t)GEMM_SUMMA_SCALE_Y,
+        (uint32_t)GEMM_SUMMA_GROUP_NUMBER,
+        (uint32_t)GEMM_SUMMA_GROUP_REDUCE,
+        (uint32_t)GEMM_SUMMA_GROUP_SPLITK,
+        (uint32_t)GEMM_SUMMA_GROUP_SPLITN,
+        (uint32_t)GEMM_SUMMA_GROUP_GAP_X,
+        (uint32_t)GEMM_SUMMA_GROUP_GAP_W,
+        (uint32_t)GEMM_SUMMA_GROUP_GAP_Z);
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        flex_timer_start();
+    flex_global_barrier_xy();
+
+    SummaGEMMRun(&gemm1_info);
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        flex_timer_end();
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        printf("[LLMForward] Layer %u: 5 -- GEMM1 (up)\n", layer_id);
+
+    // 6) SiLU activation in-place on intermediate buffer.
+    ActivationInfo act_info = ActivationAnaylze(
+        (uint32_t)q_len,
+        (uint32_t)LLM_D_FF,
+        (uint32_t)ACTI_GATE_ENABLE,
+        (uint32_t)ACTI_BIAS_ENABLE,
+        (uint64_t)LLM_ACTI_INPUT_ADDR,
+        (uint64_t)LLM_ACTI_OUTPUT_ADDR,
+        (uint64_t)0,
+        (uint64_t)0);
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        flex_timer_start();
+    flex_global_barrier_xy();
+
+    ActivationRun(&act_info);
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        flex_timer_end();
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        printf("[LLMForward] Layer %u: 6 -- SiLU\n", layer_id);
+
+    // 7) MLP down-projection.
+    uint64_t W2 = llm_w2_down_addr(layer_id);
+    SummaGEMMInfo gemm2_info = SummaGEMMAnaylze(
+        (uint64_t)LLM_GEMM2_X_ADDR,
+        (uint64_t)W2,
+        (uint64_t)LLM_GEMM2_Z_ADDR,
+        (uint32_t)q_len,
+        (uint32_t)LLM_D_MODEL,
+        (uint32_t)LLM_D_FF,
+        (uint32_t)GEMM_M_TILE,
+        (uint32_t)GEMM_N_TILE,
+        (uint32_t)GEMM_K_TILE,
+        (uint32_t)GEMM_SUMMA_SCALE_X,
+        (uint32_t)GEMM_SUMMA_SCALE_Y,
+        (uint32_t)GEMM_SUMMA_GROUP_NUMBER,
+        (uint32_t)GEMM_SUMMA_GROUP_REDUCE,
+        (uint32_t)GEMM_SUMMA_GROUP_SPLITK,
+        (uint32_t)GEMM_SUMMA_GROUP_SPLITN,
+        (uint32_t)GEMM_SUMMA_GROUP_GAP_X,
+        (uint32_t)GEMM_SUMMA_GROUP_GAP_W,
+        (uint32_t)GEMM_SUMMA_GROUP_GAP_Z);
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        flex_timer_start();
+    flex_global_barrier_xy();
+
+    SummaGEMMRun(&gemm2_info);
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        flex_timer_end();
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        printf("[LLMForward] Layer %u: 7 -- GEMM2\n", layer_id);
+
+    // 8) Residual add: H <- H + MLPOut.
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        flex_timer_start();
+    flex_global_barrier_xy();
+
+    llm_residual_add_spatz((uint64_t)LLM_H_ADDR, (uint64_t)LLM_MLP_OUT_ADDR, q_len, (uint32_t)LLM_D_MODEL);
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        flex_timer_end();
+
+    flex_global_barrier_xy();
+    if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+        printf("[LLMForward] Layer %u: 8 -- MLP residual applied\n", layer_id);
+}
+
 void llm_common_run_prefill_layer(uint32_t layer_id,
                                   uint32_t q_len,
                                   uint32_t kv_len,
@@ -864,6 +1154,6 @@ void llm_common_run_decode_layer(uint32_t layer_id,
                                  uint32_t kv_len,
                                  const LLMAttentionRuntimeArgs *attn_args)
 {
-    // Decode currently uses the same primitive; cache-specialized path comes later.
-    llm_run_transformer_layer(layer_id, q_len, kv_len, attn_args);
+    // Decode now runs attention against persistent cache and appends current-step K/V first.
+    llm_run_transformer_layer_decode_cached(layer_id, q_len, kv_len, attn_args);
 }

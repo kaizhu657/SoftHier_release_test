@@ -70,8 +70,8 @@ int main()
         {
             llm_common_barrier();
             // Decode executes one query token against growing KV context.
+            // The decode layer now appends current-step K/V internally before attention.
             llm_common_run_decode_layer(layer, 1u, kv_len, &decode_attn);
-            llm_common_store_decode_kv_cache(layer, state.cache_len, 1u);
             llm_common_log_layer_done(layer);
         }
 
