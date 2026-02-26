@@ -166,12 +166,22 @@ endif
 arch_cmake_arg := $(shell if grep "spatz_attaced_core_list" $(config_file) | grep "\[\]" > /dev/null 2>&1; then echo "-DRISCV_ARCH=rv32imafd_zfh"; else echo "-DRISCV_ARCH=rv32imafdv_zfh"; fi)
 
 sw:
-	rm -rf sw_build && mkdir sw_build
+	@mkdir -p sw_build
+	# NFS may leave busy .nfs* placeholders; clean everything else for a fresh build.
+	@find sw_build -mindepth 1 -maxdepth 1 ! -name '.nfs*' -exec rm -rf {} +
+	@if ls sw_build/.nfs* >/dev/null 2>&1; then \
+		echo "Warning: keeping busy sw_build/.nfs* files (active/stale NFS handles)"; \
+	fi
 	cd sw_build && $(CMAKE) $(sw_cmake_arg) $(arch_cmake_arg) ../soft_hier/flex_cluster_sdk/ && make
 	@! grep -q "ebreak" sw_build/softhier.dump || (echo "Error: 'ebreak' found in sw_build/softhier.dump" && exit 1)
 
 clean_sw:
-	rm -rf sw_build
+	@mkdir -p sw_build
+	@find sw_build -mindepth 1 -maxdepth 1 ! -name '.nfs*' -exec rm -rf {} +
+	@if ls sw_build/.nfs* >/dev/null 2>&1; then \
+		echo "Warning: busy sw_build/.nfs* files still present (stop gvsoc to fully remove sw_build)"; \
+	fi
+	@rmdir sw_build 2>/dev/null || true
 
 ######################################################################
 ## 				Make Targets for SoftHier HW + SW	 				##

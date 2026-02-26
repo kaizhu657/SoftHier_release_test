@@ -214,11 +214,6 @@ ifdef llm_decode_app
 	LLM_DECODE_APP = $(realpath $(llm_decode_app))
 endif
 
-LLM_FORWARD_APP ?= ${CUR_DIR}/sw/LLMForward
-ifdef llm_forward_app
-	LLM_FORWARD_APP = $(realpath $(llm_forward_app))
-endif
-
 llm-prefill-hs:
 	@echo "Compiling SoftHier HW & SW for LLM prefill ..."
 	cfg=${ARCH_FILE} app=${LLM_PREFILL_APP} make -C ${SH_DIR} hs
@@ -275,15 +270,15 @@ llm-decode-run%-only:
 	@echo "SoftHier simulation for LLM decode (run-only) ..."
 	make -C ${SH_DIR} run$*
 
-# Legacy fallback target during migration to split prefill/decode apps.
+# Legacy compatibility aliases.
 llm-hs:
-	@echo "Compiling SoftHier HW & SW for legacy LLMForward ..."
-	cfg=${ARCH_FILE} app=${LLM_FORWARD_APP} make -C ${SH_DIR} hs
+	@echo "Legacy llm-hs aliased to llm-prefill-hs ..."
+	$(MAKE) llm-prefill-hs
 
-llm-run: llm-hs
-	@echo "SoftHier simulation for legacy LLMForward ..."
-	make -C ${SH_DIR} run
+llm-run:
+	@echo "Legacy llm-run aliased to llm-prefill-run ..."
+	$(MAKE) llm-prefill-run
 
-llm-run%: llm-hs
-	@echo "SoftHier simulation for legacy LLMForward ..."
-	make -C ${SH_DIR} run$*
+llm-run%:
+	@echo "Legacy llm-run$* aliased to llm-prefill-run$* ..."
+	$(MAKE) llm-prefill-run$*
