@@ -1,81 +1,63 @@
 #include "llm_common.h"
 #include "llm_decode_cfg.h"
 
+extern void flex_barrier_xy_init(void);
+extern void flex_global_barrier_xy(void);
+extern void flex_eoc(uint32_t val);
+
 int main()
 {
     uint32_t eoc_val = 0;
+    uint32_t query_tokens = (uint32_t)LLM_DECODE_QUERY_TOKENS;
     LLMAttentionRuntimeArgs decode_attn;
+
 
     LLMRuntimeState state;
     llm_common_init_runtime(&state,
                             0u,
                             (uint32_t)LLM_DECODE_STEPS,
                             (uint32_t)LLM_MAX_CTX);
-    // Start from defaults, then apply decode-specific q_len=1-safe overrides.
-    llm_common_attn_profile_default(&decode_attn);
-    decode_attn.speculative_length = (uint32_t)LLM_DECODE_ATTN_SPECULATIVE_LENGTH;
-    decode_attn.head_dimension = (uint32_t)LLM_DECODE_ATTN_HEAD_DIM;
-    decode_attn.num_head = (uint32_t)LLM_DECODE_ATTN_NUM_HEAD;
-    decode_attn.num_head_group = (uint32_t)LLM_DECODE_ATTN_NUM_HEAD_GROUP;
-    decode_attn.batch_size = (uint32_t)LLM_DECODE_ATTN_BATCH_SIZE;
-    decode_attn.flatten_scale_x = (uint32_t)LLM_DECODE_ATTN_FLATTEN_SCALE_X;
-    decode_attn.flatten_scale_y = (uint32_t)LLM_DECODE_ATTN_FLATTEN_SCALE_Y;
-    decode_attn.flatten_shape_x = (uint32_t)LLM_DECODE_ATTN_FLATTEN_SHAPE_X;
-    decode_attn.flatten_shape_y = (uint32_t)LLM_DECODE_ATTN_FLATTEN_SHAPE_Y;
-    decode_attn.async_enable = (uint32_t)LLM_DECODE_ATTN_ASYNC_ENABLE;
-    decode_attn.dump_enable = (uint32_t)LLM_DECODE_ATTN_DUMP_ENABLE;
+    llm_init_attn_decode(&decode_attn);
 
-    llm_common_barrier_init();
-    llm_common_barrier();
+    flex_barrier_xy_init();
+    flex_global_barrier_xy();
 
-    if (!llm_common_runtime_is_valid(&state))
-    {
-        eoc_val = 1;
-        goto finish;
-    }
 
-    // Decode may start from an externally prepared cache length.
+    // Decode starts from an prepared cache length.
     state.cache_len = (uint32_t)LLM_DECODE_INIT_CACHE_LEN;
     if (state.cache_len > state.max_ctx_len)
         state.cache_len = state.max_ctx_len;
-    if (state.decode_steps > (state.max_ctx_len - state.cache_len))
-        state.decode_steps = state.max_ctx_len - state.cache_len;
 
-    if (!llm_common_runtime_is_valid(&state))
-    {
-        eoc_val = 2;
-        goto finish;
-    }
 
     // Initialize all layers so decode behavior is deterministic.
     for (uint32_t layer = 0; layer < (uint32_t)LLM_NUM_LAYERS; ++layer)
         llm_common_init_dummy_weights(layer);
 
     llm_common_init_hidden_state();
-    llm_common_barrier();
+    flex_global_barrier_xy();
     llm_common_log_start();
 
     for (uint32_t step = 0; step < state.decode_steps; ++step)
     {
-        if (!llm_common_cache_can_append(&state, 1u))
+        if (!llm_common_cache_can_append(&state, query_tokens))
         {
             eoc_val = 3;
             break;
         }
 
-        // Current step attends to all cached tokens plus the new query token.
-        const uint32_t kv_len = state.cache_len + 1u;
+        // Current step attends to all cached tokens plus new query_tokens.
+        const uint32_t kv_len = state.cache_len + query_tokens;
 
         for (uint32_t layer = 0; layer < (uint32_t)LLM_NUM_LAYERS; ++layer)
         {
-            llm_common_barrier();
-            // Decode executes one query token against growing KV context.
-            // The decode layer now appends current-step K/V internally before attention.
-            llm_common_run_decode_layer(layer, 1u, kv_len, &decode_attn);
+            flex_global_barrier_xy();
+            // Decode executes a configurable query chunk against growing KV context.
+            // The decode layer appends current-step K/V internally before attention.
+            llm_common_run_decode_layer(layer, query_tokens, kv_len, &decode_attn);
             llm_common_log_layer_done(layer);
         }
 
-        if (!llm_common_cache_append(&state, 1u))
+        if (!llm_common_cache_append(&state, query_tokens))
         {
             eoc_val = 4;
             break;
@@ -93,7 +75,7 @@ int main()
 #endif
 
 finish:
-    llm_common_barrier();
-    llm_common_eoc(eoc_val);
+    flex_global_barrier_xy();
+    flex_eoc(eoc_val);
     return 0;
 }

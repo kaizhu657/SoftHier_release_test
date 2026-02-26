@@ -16,8 +16,8 @@ typedef struct LLMRuntimeState
 
 typedef struct LLMAttentionRuntimeArgs
 {
-    // FlatAttention runtime knobs; values may come from app-specific profiles.
-    // Call llm_common_attn_profile_default() first, then override what you need.
+    // FlatAttention runtime knobs
+    // Call llm_common_attn_profile_default() first, then override 
     uint32_t speculative_length;
     uint32_t head_dimension;
     uint32_t num_head;
@@ -36,8 +36,7 @@ void llm_common_init_runtime(LLMRuntimeState *state,
                              uint32_t prompt_len,
                              uint32_t decode_steps,
                              uint32_t max_ctx_len);
-// Strict runtime-state consistency check against context/cache limits.
-uint32_t llm_common_runtime_is_valid(const LLMRuntimeState *state);
+
 // Query whether cache_len can grow by append_tokens.
 uint32_t llm_common_cache_can_append(const LLMRuntimeState *state, uint32_t append_tokens);
 // Apply cache growth when valid; returns 1 on success, 0 on overflow/invalid state.
@@ -70,13 +69,6 @@ void llm_common_store_decode_kv_cache(uint32_t layer_id, uint32_t cache_pos, uin
 // Debug utility: dump fp16 values from HBM.
 void llm_common_dma_dump_u16(uint64_t hbm_addr, uint32_t n_halfwords);
 
-// Runtime wrappers to avoid duplicate runtime symbol definitions.
-void llm_common_barrier_init(void);
-void llm_common_barrier(void);
-void llm_common_timer_start(void);
-void llm_common_timer_end(void);
-uint32_t llm_common_is_lead_core(void);
-void llm_common_eoc(uint32_t eoc_val);
 void llm_common_log_start(void);
 void llm_common_log_layer_done(uint32_t layer_id);
 

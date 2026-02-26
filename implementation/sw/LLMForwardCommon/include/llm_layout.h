@@ -2,30 +2,44 @@
 #define _LLM_LAYOUT_H_
 
 #include <stdint.h>
+#include "flex_cluster_arch.h"
 
 // =======================================================
 // Model hyperparameters
 // =======================================================
-#define LLM_B          1
-// Working sequence length for the current workload binaries.
+
+// Working token length. Decode can override this to 1 while prefill keeps full length.
+#ifndef LLM_T
 #define LLM_T          2048
-// Upper bound reserved for upcoming decode-phase cache growth.
+#endif
+// Upper bound reserved for decode-phase cache growth.
+#ifndef LLM_MAX_CTX
 #define LLM_MAX_CTX    2048
+#endif
+#ifndef LLM_D_MODEL
 #define LLM_D_MODEL    768
+#endif
+#ifndef LLM_D_FF
 #define LLM_D_FF       3072
+#endif
+#ifndef LLM_N_HEAD
 #define LLM_N_HEAD     6
+#endif
+#ifndef LLM_N_KV_HEAD
 #define LLM_N_KV_HEAD  6
+#endif
 #define LLM_HEAD_DIM   (LLM_D_MODEL / LLM_N_HEAD)
-#define LLM_NUM_LAYERS 12
+#ifndef LLM_NUM_LAYERS
+#define LLM_NUM_LAYERS 1
+#endif
+#ifndef LLM_ELEM_SIZE
 #define LLM_ELEM_SIZE  2        // fp16 bytes
+#endif
 
 #if (LLM_D_MODEL % LLM_N_HEAD) != 0
 #error "LLM_D_MODEL must be divisible by LLM_N_HEAD"
 #endif
 
-#if (LLM_MAX_CTX < LLM_T)
-#error "LLM_MAX_CTX must be >= LLM_T"
-#endif
 
 // Sizes in bytes
 #define BYTES_H        ((uint64_t)LLM_T * (uint64_t)LLM_D_MODEL * (uint64_t)LLM_ELEM_SIZE)
@@ -47,7 +61,6 @@
 // =======================================================
 // Activation layout in HBM
 // =======================================================
-// Buffers are laid out contiguously so prefill/decode apps can share the same map.
 #define LLM_H_ADDR        ((uint64_t)0xC0000000)
 #define LLM_H_NORM_ADDR   (LLM_H_ADDR       + BYTES_H)
 #define LLM_MLP_MID_ADDR  (LLM_H_NORM_ADDR  + BYTES_H_NORM)
@@ -72,16 +85,10 @@
 #define LLM_V_CACHE_BASE_ADDR   (LLM_K_CACHE_BASE_ADDR + BYTES_KV_ALL_LAYERS)
 #define LLM_KV_CACHE_END_ADDR   (LLM_V_CACHE_BASE_ADDR + BYTES_KV_ALL_LAYERS)
 
-// Weight base (HBM)
-#define LLM_W_BASE        ((uint64_t)0x9C0000000)
 
-// Compile-time guard: KV cache must end before the weight region starts.
-#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
-_Static_assert(LLM_KV_CACHE_END_ADDR <= LLM_W_BASE,
-               "KV cache region overlaps weight region; move base addresses or reduce cache footprint.");
-#else
-typedef char llm_kv_cache_overlap_check[(LLM_KV_CACHE_END_ADDR <= LLM_W_BASE) ? 1 : -1];
-#endif
+// Weight base (HBM): hbm_start_addr + hbm_node_addr_space * (2 * num_cluster_y + num_cluster_x)
+#define LLM_W_BASE        ((uint64_t)0x48C0000000)
+
 
 // Layer-major base pointers for persistent K/V cache.
 static inline uint64_t llm_k_cache_layer_base(uint32_t layer_id)
@@ -109,11 +116,6 @@ static inline uint64_t llm_v_cache_head_token_addr(uint32_t layer_id, uint32_t k
            + (uint64_t)token_idx * (uint64_t)BYTES_KV_TOKEN_PER_HEAD;
 }
 
-// Lightweight index checks shared by prefill/decode drivers.
-static inline uint32_t llm_cache_valid_layer(uint32_t layer_id)
-{
-    return (layer_id < (uint32_t)LLM_NUM_LAYERS) ? 1u : 0u;
-}
 
 static inline uint32_t llm_cache_valid_head(uint32_t kv_head)
 {

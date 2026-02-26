@@ -28,6 +28,7 @@
 
 #define LLM_LAYER_W_STRIDE (LLM_ALIGN_UP(OFF_W2_DOWN + BYTES_W2_DOWN, W_ALIGN_BYTES))
 
+
 // Resolve absolute addresses for a given transformer layer.
 static inline uint64_t llm_w_layer_base(uint32_t layer_id)
 {

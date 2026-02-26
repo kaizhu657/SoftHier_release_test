@@ -1,5 +1,13 @@
 #include "llm_common.h"
 
+extern void flex_barrier_xy_init(void);
+extern void flex_global_barrier_xy(void);
+extern uint32_t flex_get_core_id(void);
+extern uint32_t flex_get_cluster_id(void);
+extern void flex_timer_start(void);
+extern void flex_timer_end(void);
+extern void flex_eoc(uint32_t val);
+
 #define LLM_DEBUG_DUMP 0
 
 int main()
@@ -15,7 +23,7 @@ int main()
     // Legacy app sticks to default attention profile for compatibility.
     llm_common_attn_profile_default(&attn_profile);
 
-    llm_common_barrier_init();
+    flex_barrier_xy_init();
 
     // Init weights and activations in HBM (layer 0 deterministic baseline).
     llm_common_init_dummy_weights(0);
@@ -25,30 +33,31 @@ int main()
 #endif
 
     llm_common_init_hidden_state();
-    llm_common_barrier();
+    flex_global_barrier_xy();
 
     llm_common_log_start();
 
     for (uint32_t layer = 0; layer < (uint32_t)LLM_NUM_LAYERS; ++layer)
     {
-        llm_common_barrier();
+        flex_global_barrier_xy();
 
-        llm_common_timer_start();
-        llm_common_barrier();
+        if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
+            flex_timer_start();
+        flex_global_barrier_xy();
 
         llm_common_run_prefill_layer(layer, q_len, kv_len, &attn_profile);
 
-        llm_common_barrier();
-        if (llm_common_is_lead_core())
+        flex_global_barrier_xy();
+        if (flex_get_core_id() == 0 && flex_get_cluster_id() == 0)
         {
-            llm_common_timer_end();
+            flex_timer_end();
             llm_common_log_layer_done(layer);
         }
     }
 
     llm_common_dma_dump_u16((uint64_t)LLM_H_ADDR, 8);
 
-    llm_common_barrier();
-    llm_common_eoc(eoc_val);
+    flex_global_barrier_xy();
+    flex_eoc(eoc_val);
     return 0;
 }

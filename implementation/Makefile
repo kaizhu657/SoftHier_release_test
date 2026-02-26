@@ -197,3 +197,93 @@ acti-run%: acti-pre
 acti-clean:
 	@echo "clean up intermidiate files generated for Activation ..."
 	rm -f ${CUR_DIR}/sw/Activation/include/acti.h ${CUR_DIR}/sw/Activation/preload.elf ${CUR_DIR}/sw/Activation/preload.dump ${CUR_DIR}/sw/Activation/include/preload.h ${SH_DIR}/dump_*
+
+
+#####################
+#   LLM Workloads   #
+#####################
+
+# App paths are overridable while sharing the same ARCH_FILE cfg default.
+LLM_PREFILL_APP ?= ${CUR_DIR}/sw/LLMForwardPrefill
+ifdef llm_prefill_app
+	LLM_PREFILL_APP = $(realpath $(llm_prefill_app))
+endif
+
+LLM_DECODE_APP ?= ${CUR_DIR}/sw/LLMForwardDecode
+ifdef llm_decode_app
+	LLM_DECODE_APP = $(realpath $(llm_decode_app))
+endif
+
+LLM_FORWARD_APP ?= ${CUR_DIR}/sw/LLMForward
+ifdef llm_forward_app
+	LLM_FORWARD_APP = $(realpath $(llm_forward_app))
+endif
+
+llm-prefill-hs:
+	@echo "Compiling SoftHier HW & SW for LLM prefill ..."
+	cfg=${ARCH_FILE} app=${LLM_PREFILL_APP} make -C ${SH_DIR} hs
+
+# Faster iteration path: refresh config and rebuild software only.
+llm-prefill-sw:
+	@echo "Compiling SoftHier SW for LLM prefill ..."
+	cfg=${ARCH_FILE} make -C ${SH_DIR} config
+	cfg=${ARCH_FILE} app=${LLM_PREFILL_APP} make -C ${SH_DIR} sw
+
+llm-prefill-run: llm-prefill-hs
+	@echo "SoftHier simulation for LLM prefill ..."
+	make -C ${SH_DIR} run
+
+# Run-only target assumes HW/SW were already prepared.
+llm-prefill-run-only:
+	@echo "SoftHier simulation for LLM prefill (run-only) ..."
+	make -C ${SH_DIR} run
+
+llm-prefill-run%: llm-prefill-hs
+	@echo "SoftHier simulation for LLM prefill ..."
+	make -C ${SH_DIR} run$*
+
+# Run%-only target avoids forcing a full hs rebuild.
+llm-prefill-run%-only:
+	@echo "SoftHier simulation for LLM prefill (run-only) ..."
+	make -C ${SH_DIR} run$*
+
+llm-decode-hs:
+	@echo "Compiling SoftHier HW & SW for LLM decode ..."
+	cfg=${ARCH_FILE} app=${LLM_DECODE_APP} make -C ${SH_DIR} hs
+
+# Faster iteration path: refresh config and rebuild software only.
+llm-decode-sw:
+	@echo "Compiling SoftHier SW for LLM decode ..."
+	cfg=${ARCH_FILE} make -C ${SH_DIR} config
+	cfg=${ARCH_FILE} app=${LLM_DECODE_APP} make -C ${SH_DIR} sw
+
+llm-decode-run: llm-decode-hs
+	@echo "SoftHier simulation for LLM decode ..."
+	make -C ${SH_DIR} run
+
+# Run-only target assumes HW/SW were already prepared.
+llm-decode-run-only:
+	@echo "SoftHier simulation for LLM decode (run-only) ..."
+	make -C ${SH_DIR} run
+
+llm-decode-run%: llm-decode-hs
+	@echo "SoftHier simulation for LLM decode ..."
+	make -C ${SH_DIR} run$*
+
+# Run%-only target avoids forcing a full hs rebuild.
+llm-decode-run%-only:
+	@echo "SoftHier simulation for LLM decode (run-only) ..."
+	make -C ${SH_DIR} run$*
+
+# Legacy fallback target during migration to split prefill/decode apps.
+llm-hs:
+	@echo "Compiling SoftHier HW & SW for legacy LLMForward ..."
+	cfg=${ARCH_FILE} app=${LLM_FORWARD_APP} make -C ${SH_DIR} hs
+
+llm-run: llm-hs
+	@echo "SoftHier simulation for legacy LLMForward ..."
+	make -C ${SH_DIR} run
+
+llm-run%: llm-hs
+	@echo "SoftHier simulation for legacy LLMForward ..."
+	make -C ${SH_DIR} run$*

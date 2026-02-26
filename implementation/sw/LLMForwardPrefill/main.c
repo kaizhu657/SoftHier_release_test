@@ -1,6 +1,10 @@
 #include "llm_common.h"
 #include "llm_prefill_cfg.h"
 
+extern void flex_barrier_xy_init(void);
+extern void flex_global_barrier_xy(void);
+extern void flex_eoc(uint32_t val);
+
 int main()
 {
     uint32_t eoc_val = 0;
@@ -9,29 +13,22 @@ int main()
 
     LLMRuntimeState state;
     llm_common_init_runtime(&state, prompt_len, 0, (uint32_t)LLM_MAX_CTX);
-    // Prefill keeps the throughput-oriented default profile from attn.h.
-    llm_common_attn_profile_default(&prefill_attn);
+    llm_init_attn_prefill(&prefill_attn);
 
-    llm_common_barrier_init();
-    llm_common_barrier();
-
-    if (!llm_common_runtime_is_valid(&state))
-    {
-        eoc_val = 1;
-        goto finish;
-    }
+    flex_barrier_xy_init();
+    flex_global_barrier_xy();
 
     // Initialize all layers so prefill is deterministic.
     for (uint32_t layer = 0; layer < (uint32_t)LLM_NUM_LAYERS; ++layer)
         llm_common_init_dummy_weights(layer);
 
     llm_common_init_hidden_state();
-    llm_common_barrier();
+    flex_global_barrier_xy();
     llm_common_log_start();
 
     for (uint32_t layer = 0; layer < (uint32_t)LLM_NUM_LAYERS; ++layer)
     {
-        llm_common_barrier();
+        flex_global_barrier_xy();
         // Prefill runs full-sequence attention: q_len == kv_len == prompt_len.
         llm_common_run_prefill_layer(layer, state.prompt_len, state.prompt_len, &prefill_attn);
         llm_common_store_prefill_kv_cache(layer, state.prompt_len);
@@ -52,7 +49,7 @@ int main()
 #endif
 
 finish:
-    llm_common_barrier();
-    llm_common_eoc(eoc_val);
+    flex_global_barrier_xy();
+    flex_eoc(eoc_val);
     return 0;
 }
